@@ -1,0 +1,785 @@
+<!DOCTYPE HTML> 
+<html lang="en"> 
+<head>
+<title>Ray Tracing</title>
+<link rel="shortcut icon" href="">
+<meta charset="utf-8"> 
+</head>
+    
+<!-- Author: @Casey Rodgers -->
+<!-- Reference: https://raytracing.github.io/books/RayTracingInOneWeekend.html -->
+  
+<!-- Object Shaders -->
+<!-- Vertex -->
+<script id="shader-vs" type="x-shader/x-vertex">
+   attribute vec3 aVertexPosition;
+        
+    void main(void) {
+        
+        gl_Position = vec4(aVertexPosition, 1.0);
+        
+    }
+</script>
+
+  
+<!-- Fragment -->  
+
+<script id="shader-fs" type="x-shader/x-fragment">
+precision mediump float;
+    
+    uniform vec2 uRes;
+    
+    uniform sampler2D objects;
+    uniform sampler2D objPos;
+    uniform sampler2D objMat;
+    
+    uniform int numObjects;
+    uniform float texSize;
+    
+    uniform sampler2D minBvh;
+    uniform sampler2D maxBvh;
+    
+    uniform float bvhSize;
+    
+    uniform vec3 lightPos;
+    
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+    uniform mat3 uNMatrix;
+    
+    uniform mat4 uMVMatrixInv;
+    
+    uniform vec3 cameraLoc;
+    
+    float infinity = 1.0 / 0.0000000000000001;
+    float pi = 3.1415926535897932385;
+    
+    vec3 testColor;
+    
+    #define i0 0
+    #define i1 1
+    #define i2 2
+    #define i3 3
+    #define i4 4
+    #define i5 5
+    #define i6 6
+    #define i7 7
+    #define i8 8
+    #define i9 9
+    
+    #define i10 10
+    #define i11 11
+    #define i12 12
+    #define i13 13
+    #define i14 14
+    #define i15 15
+    #define i16 16
+    #define i17 17
+    #define i18 18
+    #define i19 19
+    #define i20 20
+    
+    #define MAX_ITER 200
+    
+    
+    
+    // Random function
+    // @param vec2 st = vector for randomization
+    // @param float min = min bound for value
+    // @param float max = max bound for value
+    // Reference: https://thebookofshaders.com/10/ 
+    
+    float rand (vec2 st, float min, float max) {
+    
+        // Random number < 1 and >= 0
+        float result = fract(sin(dot(gl_FragCoord.xy + st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+        for (int i = 0; i < MAX_ITER; i++) {
+            if (result != 1.0) {break;}
+            result = fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+        }
+        
+        // Find number between bounds
+        float result2 = min + (max - min) * result;
+        return result2;
+    }
+    
+    
+    
+    
+    // Random in unit sphere
+    // @param float alpha = random value
+    
+    vec3 random_in_unit_sphere (float alpha) {
+        
+        float count = 547.456;
+        for (int i = 0; i < MAX_ITER; i++) {
+        
+            float ind1 = rand(vec2(alpha * count, alpha + count), -1.0, 1.0);
+            float ind2 = rand(vec2(alpha - count, alpha / count), -1.0, 1.0);
+            float ind3 = rand(vec2(count / alpha, count - alpha), -1.0, 1.0);
+            
+            vec3 res = vec3(ind1, ind2, ind3);
+            count++;
+            
+            if (length(res) * length(res) >= 1.0) {continue;}
+            
+            return res;
+        
+        }
+        
+    }
+    
+    
+    
+    
+    // Random unit vector
+    
+    vec3 random_unit_vector (in float alpha) {
+        return normalize(random_in_unit_sphere(alpha));
+    }
+
+    
+        
+    
+    // Find and return normal of to be outward facing
+    // @param vec3 dir = ray direction
+    // @param vec3 position = position on object
+    // @param vec2 id = id coords to find object in texture
+    
+    vec3 normal(in vec3 dir, in vec3 position, in vec2 id) {
+    
+        int currType = int(texture2D(objects, id).y * 256.0);
+        vec3 currNorm;
+            
+        // If it's a sphere,
+        if (currType == i1) {
+            vec4 sphere = texture2D(objPos, id);
+            currNorm = (position - sphere.xyz) / sphere.w;
+            
+        // If it's a plane,
+        } else if (currType == i2) {
+            vec4 plane = texture2D(objPos, id);
+            currNorm = plane.xyz;
+        }
+        
+        // Make sure it's outward facing
+        if (dot(dir, currNorm) > 0.0) {
+            // ray is inside the sphere
+            currNorm *= -1.0;
+        }
+        
+        return currNorm;
+    }
+    
+    
+    
+    
+    // Sphere bounding box
+    // @param vec4 sphere = sphere pos & radius
+    // @param vec3 minAabb = min aabb value
+    // @param vec3 maxAabb = max aabb value
+    
+    bool aabbHit(in vec4 sphere, inout vec3 minAabb, inout vec3 maxAabb) {
+    
+        minAabb = sphere.xyz - vec3(sphere.w, sphere.w, sphere.w);
+        maxAabb = sphere.xyz + vec3(sphere.w, sphere.w, sphere.w);
+        
+        return true;
+    }
+    
+    
+    
+    
+    
+    // Does the ray hit the aabb? (think ray hitting a box with 6 sides, 2 per component xyz)
+    // @param vec3 origin = ray origin
+    // @param vec3 dir = ray direction
+    // @param float t_min = t value nearest to eye
+    // @param vec3 minAabb = min aabb value
+    // @param vec3 maxAabb = max aabb value
+    
+    bool aabbHit(in vec3 origin, in vec3 dir, inout float t_closest, in vec3 minAabb, in vec3 maxAabb) {
+    
+        float t_min;
+        float t_max;
+        
+        // Go through each component: x, y, z
+        for (int i = 0; i < 3; i++) {
+            float invDir = 1.0 / dir[i];
+            float t0 = (minAabb[i] - origin[i]) * invDir;
+            float t1 = (maxAabb[i] - origin[i]) * invDir;
+            
+            // Swap t0 and t1 if invDir is neg
+            if (invDir < 0.0) {
+                float temp = t0;
+                t0 = t1;
+                t1 = temp;
+            }
+            
+            // Set t_min and t_max properly
+            if (i == i0 || t0 > t_min) {
+                t_min = t0;
+            }
+            if (i == i0 || t1 < t_max) {
+                t_max = t1;
+            }
+            
+            if (t_max <= t_min) {
+                return false;
+            }
+        } //End for
+        
+        return true;
+    }
+    
+
+    
+    
+    
+    
+    // Does our ray intersect with a sphere?
+    // Solve for roots of the equation: t^2 b dot b + 2tb dot (A - C) + (A - C) dot (A - C) - r^2 = 0
+    // where A = origin, C = center, b = ray dir, r = radius, t = unknown
+    // This equation is equal to: at^2 + bt + c = 0
+    // Number and type of roots determines if it hits sphere:
+    // 0 roots = miss
+    // 1 or 2 pos roots = hit
+    // neg roots = miss
+    // @param vec2 id = coords of closest sphere in texture
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t_closest = t value closest to eyepoint (aka min t value that's a hit)
+    // @param vec2 id_closest = coords of closest sphere in texture
+    
+    bool hitSphere(in vec2 id, in vec4 sphere, in vec3 origin, in vec3 dir, inout float t_closest, inout vec2 id_closest) {
+    
+        vec3 center = sphere.xyz;
+        float radius = sphere.w;
+        
+        vec3 oc = origin - center;
+        float a = length(dir) * length(dir);
+        float bHalf = dot(oc, dir);
+        float c = length(oc) * length(oc) - radius * radius;
+        float discrimin = bHalf * bHalf - a * c;
+        
+        // Misses
+        if (discrimin < 0.0) {
+            return false;
+        }
+        
+        
+        // Find nearest root that lies in acceptable range
+        float sqrtd = sqrt(discrimin);
+        float root = (-bHalf - sqrtd) / a;
+        
+        // See if root is smallest (aka closest to screen or not)
+        if (root < t_closest && root > 0.0) {
+            t_closest = root;
+            id_closest = id;
+            return true; 
+        } 
+        
+        return false;
+       
+    }
+    
+    
+    
+    
+    
+    // Does our ray intersect with a plane?
+    // Since we are assuming the plane is flat and parallel with the x and y axes, then we just need to 
+    // check the y value of the ray and see
+    // @param vec2 id = coords of closest objecy in texture
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t_closest = t value closest to eyepoint (aka min t value that's a hit)
+    // @param vec2 id_closest = coords of closest object in texture
+    
+    bool hitPlane(in vec2 id, in vec4 plane, in vec3 origin, in vec3 dir, inout float t_closest, inout vec2 id_closest) {
+        
+        float t = (plane.y - origin.y) / dir.y;
+        
+        // Misses
+        if (t < 0.0) {
+            return false;
+        }
+        
+        // Hit
+        if (t < t_closest && t > 0.0) {
+            t_closest = t;
+            id_closest = id;
+            return true; 
+        } 
+        
+        return false;
+       
+    }
+    
+    
+    
+    
+    
+    // Do we hit anything?
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t_closest = t value closest to eyepoint (aka min t value that's a hit)
+    // @param vec2 id_closest = coords of closest sphere in texture
+    
+    bool hittable(in vec3 origin, in vec3 dir, inout float t_closest, inout vec2 id_closest) {
+    
+        // First we need to see if we hit the plane since it's not in the bvh
+        float itx2 = 1.0 / texSize / 2.0;
+        float ity2 = 1.0 / texSize / 2.0;
+        vec4 plane = texture2D(objPos, vec2(itx2, ity2));
+        
+        bool hit_anything = hitPlane(vec2(itx2, ity2), plane, origin, dir, t_closest, id_closest); 
+        
+    
+        // Texture coords (to step through bvh)
+        float itx = 1.0 / bvhSize / 2.0;
+        float ity = 1.0 / bvhSize / 2.0;
+        
+        // Step size to go through objects
+        float step = 1.0 / bvhSize;
+        
+        // Get overall min and max
+        vec3 overallMin = texture2D(minBvh, vec2(itx, ity)).xyz;
+        vec3 overallMax = texture2D(maxBvh, vec2(itx, ity)).xyz;
+        
+        // Check overall first
+        bool overallHit = aabbHit(origin, dir, t_closest, overallMin, overallMax);
+        
+        // If we don't hit it, then we don't hit any spheres
+        if (!overallHit) {return hit_anything;}
+        
+        // If we do, then we possibly hit a sphere
+        float currParent = 0.0;       // Current tree level
+        
+        // Adjust coords to check next one
+        itx += step;
+
+        // If we reach end of the row, then check next row
+        if (itx > 1.0) {
+            ity += step;
+            itx = step / 2.0;
+        }
+        
+        // Go through each level
+        for (int i = 0; i < MAX_ITER; i++) {
+            
+            // Do we hit any aabbs? If yes, then go to next level. If no, then stop.
+            bool levelHit = false;
+            
+            // Per level, check entire level
+            for (int j = 0; j < MAX_ITER; j++) {
+            
+                // If we reach the end of the texture, break;
+                if (ity > 1.0) {break;}
+            
+                // If we get to next level, then break
+                float parent = texture2D(maxBvh, vec2(itx, ity)).y;
+                if (parent > currParent) {break;}
+            
+                // Grab the minAabb and maxAabb
+                vec3 minAabb = vec3(texture2D(minBvh, vec2(itx, ity)).x, overallMin.y, overallMin.z);
+                vec3 maxAabb = vec3(texture2D(maxBvh, vec2(itx, ity)).x, overallMax.y, overallMax.z);
+
+                // Check to see if it's a sphere and then test the hit:
+                vec2 sphereCheck = texture2D(maxBvh, vec2(itx, ity)).zw;
+                if (maxAabb.x == 1.0 && sphereCheck.x == 1.0 && sphereCheck.y == 1.0) {
+                    vec2 sphereID = texture2D(minBvh, vec2(itx, ity)).xy;
+                    vec4 sphere = texture2D(objPos, sphereID);
+                    bool yesHit = hitSphere(sphereID, sphere, origin, dir, t_closest, id_closest);
+
+                    // If the sphere hit is true, then hit_anything is true:
+                    if (yesHit) {
+                        hit_anything = true;
+                    }
+
+
+                // Otherwise, it's a box AABB
+                } else {
+                    bool yesHit2 = aabbHit(origin, dir, t_closest, minAabb, maxAabb);
+                    
+                    // If we hit an aabb, then make levelHit true
+                    if (yesHit2) {
+                        levelHit = true;
+                    }
+                    
+                }//End if
+                
+                // Go to next one
+                itx += step;
+
+                // If we reach end of the row, then check next row
+                if (itx > 1.0) {
+                    ity += step;
+                    itx = step / 2.0;
+                }
+                
+                
+            }//End for
+            
+            
+            // If we didn't hit any aabb's for the level, then we are done
+            if (!levelHit) {break;}
+            
+            // Otherwise, increase parent
+            currParent++;
+            
+            
+            
+            // Old
+            //if (i >= numObjects){break;}
+            // Get object type
+            //int currType = int(texture2D(objects, vec2(itx, ity)).y * 256.0);
+            //bool yesHit = false;
+            // If it's a sphere, see if it intersects
+            //if (currType == i1) {
+            //    vec4 sphere = texture2D(objPos, vec2(itx, ity));
+            //    yesHit = hitSphere(vec2(itx, ity), sphere, origin, dir, t_closest, id_closest);
+            // Else if it's a plane, see if it intersects. (Assume flat (with x axis) plane)
+            //} else if (currType == i2) {
+            //    vec4 plane = texture2D(objPos, vec2(itx, ity));
+            //    yesHit = hitPlane(vec2(itx, ity), plane, origin, dir, t_closest, id_closest);    
+            //}
+            // Adjust hit anything
+            //if (!hit_anything && yesHit) {
+            //    hit_anything = yesHit;
+            //}
+            
+            
+        } //End for
+        
+        return hit_anything;
+        
+    } //End method
+
+
+    
+    
+    
+    // Checker pattern for floor
+    // @param vec3 point = point on plane
+    
+    vec3 checker(in vec3 point) {
+        
+        // Figure out what sin it is
+        float sines = sin(5.0 * float(point.x)) * sin(5.0 * float(point.y)) * sin(5.0 * float(point.z));
+        
+        // Figure out color based on sin
+        if (sines < 0.0) {
+            return vec3(135.0/255.0, 225.0/255.0, 135.0/255.0);
+        } else {
+            return vec3(223.0/255.0, 190.0/255.0, 183.0/255.0);
+        }
+        
+    }
+    
+    
+    
+    
+    
+    // Diffuse surface lighting
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t = t value 
+    // @param vec2 id = coords of sphere in texture
+    
+    vec3 diffuse(in vec3 origin, in vec3 dir, in float t, in vec2 id) {
+    
+        vec3 point = origin + t * dir;
+        
+        // Figure out normal
+        int currType = int(texture2D(objects, id).y * 256.0);
+        vec3 norm = normal(dir, point, id);
+        
+        // Base color (checker for planes)
+        vec3 color = 0.01 * texture2D(objMat, id).xyz;
+        if (currType == 2) {
+            color = 0.01 * checker(point);
+        }
+        
+        // Can the point see the light source?
+        vec3 vecToLightSource = normalize(lightPos - point);
+        vec2 shadowID = vec2(-1.0, -1.0);
+        float shadowT = 1000.0;
+        
+        bool yesHit = hittable(point + vecToLightSource * 0.001, vecToLightSource, shadowT, shadowID);
+        
+        // If point can't see light, then diffuse lighting
+        if (shadowID.x < 0.0 || shadowT < 0.01) {
+            float dp = dot(norm, vecToLightSource);
+            if (dp > 0.0) {
+                if (currType == 2) {
+                    color += dp * checker(point);
+                } else {
+                    color += dp * texture2D(objMat, id).xyz;
+                }
+            } //End if
+        } //End if
+        
+        return color;
+        
+    }
+    
+    
+    
+    
+    // Refraction surface lighting
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t = t value 
+    // @param vec2 id = coords of sphere in texture
+    
+    vec3 refraction(in vec3 origin, in vec3 dir, in float t, in vec2 id) {
+    
+        vec3 point = origin + t * dir;
+        vec3 norm = normal(dir, point, id);
+        
+        vec3 R = refract(normalize(dir), norm, 1.00/1.52);     // Refraction direction
+        
+        // Check if refraction ray hits an object
+        vec2 refractID = vec2(-1.0, -1.0);
+        float refractT = 1000.0;
+        bool yesHit = hittable(point + R * 0.001, R, refractT, refractID);
+        
+        vec3 glassColor = vec3(1.0, 1.0, 1.0);
+        vec3 refractColor = vec3(0.0, 0.0, 0.0);
+        
+        // If we intersected an object
+        if (refractID.x > 0.0) {
+        
+            refractColor = diffuse(point + R * 0.001, R, refractT, refractID);
+            
+        // Otherwise use background color
+        } else {
+            float a = 0.5 * (normalize(R).y + 1.0);
+            vec3 color1 = vec3(1.0, 1.0, 1.0);
+            vec3 color2 = vec3(0.5, 0.7, 1.0);
+            refractColor = (1.0 - a) * color1 + a * color2;
+        }
+        
+        vec3 resColor = mix(refractColor, glassColor, 0.3);
+        return resColor;
+        
+    }
+    
+    
+    
+    
+    
+    // Reflection surface lighting
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t = t value 
+    // @param vec2 id = coords of sphere in texture
+    
+    vec3 reflection(in vec3 origin, in vec3 dir, in float t, in vec2 id) {
+    
+        vec3 matColor = texture2D(objMat, id).xyz;
+        vec3 point = origin + t * dir;
+        vec3 norm = normal(dir, point, id);
+        //vec4 N = uMVMatrixInv * vec4(vNorm, 1.0);
+        //vec3 norm = normalize(N.xyz);
+        
+        vec3 R = reflect(normalize(dir), norm);     // Reflection direction
+        
+        // Check if reflection ray hits an object
+        vec2 reflectID = vec2(-1.0, -1.0);
+        float reflectT = 1000.0;
+        bool yesHit = hittable(point + R * 0.001, R, reflectT, reflectID);
+        
+        // Set initial color as background color
+        float a = 0.5 * (normalize(R).y + 1.0);
+        vec3 color1 = vec3(1.0, 1.0, 1.0);
+        vec3 color2 = vec3(0.5, 0.7, 1.0);
+        vec3 color = (1.0 - a) * color1 + a * color2;
+        color *= matColor;
+        
+        // If we intersected an object
+        if (reflectID.x > 0.0) {
+        
+            int matType = int(texture2D(objects, reflectID).z * 256.0);
+            
+            if (matType == 3) {
+                color = matColor * refraction(point + R * 0.001, R, reflectT, reflectID);
+            } else {
+                color = matColor * diffuse(point + R * 0.001, R, reflectT, reflectID);
+            }
+
+        } //End if
+        
+        return color;
+        
+    }
+    
+    
+    
+    
+    
+    // Compute lighting
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param float t = t value 
+    // @param vec2 id = coords of sphere in texture
+    
+    vec3 computeLighting(in vec3 origin, in vec3 dir, in float t, in vec2 id) {
+    
+        vec3 color = vec3(0.0, 0.0, 0.0);
+        int matType = int(texture2D(objects, id).z * 256.0);
+
+        // MatType: 1 = diffuse, 2 = reflect, 3 = refract
+        if (matType == i1) {
+            color = diffuse(origin, dir, t, id);
+        } else if (matType == i2) {
+            color = reflection(origin, dir, t, id);
+        } else if (matType == i3) {
+            color = refraction(origin, dir, t, id);
+        }
+        
+        return color;
+
+    }
+    
+    
+    
+    
+    
+    
+    // Coloring 
+    // @param vec3 origin = origin of ray
+    // @param vec3 dir = direction of ray
+    // @param int depth = max recursion depth
+    // @param float t = t value 
+    // @param vec2 id = coords of sphere in texture
+    
+    vec3 ray_color(in vec3 origin, in vec3 dir, in float t, in vec2 id) {
+            
+        // Check if ray hits an object
+        bool hitYes = hittable(origin, dir, t, id);
+        
+        if (id.x > 0.0) {
+        
+            vec3 color = computeLighting(origin, dir, t, id);
+            //vec3 color = vec3(1.0, 0.0, 0.0);
+            return color;
+        } 
+
+        // Background color
+        float a = 0.5 * (dir.y + 1.0);
+        vec3 color1 = vec3(1.0, 1.0, 1.0);
+        vec3 color2 = vec3(0.5, 0.7, 1.0);
+        vec3 result = (1.0 - a) * color1 + a * color2;
+        return result;
+    
+    }
+    
+    
+    
+    
+    // Sample average 
+    // @param vec3 vColor = color needing averaging
+    // @param int samplesPerPixel = number of samples per pixel
+    
+    vec3 writeColor (in vec3 vColor, in int samplesPerPixel) {
+        float scale = 1.0 / float(samplesPerPixel);
+        vec3 resultColor = vColor * scale;
+        resultColor.x = clamp(resultColor.x, 0.0, 1.0);
+        resultColor.y = clamp(resultColor.y, 0.0, 1.0);
+        resultColor.z = clamp(resultColor.z, 0.0, 1.0);
+        return resultColor;
+    }
+    
+    
+    
+    
+    // Set up Camera
+    // @param float count = for random function
+    // @param vec3 origin = origin of ray tracing
+    // @param vec3 dir = direction of ray
+    
+    void camera (in float count, inout vec3 origin, inout vec3 dir) {
+        
+        // Origin
+        origin = cameraLoc;
+        
+        // Direction
+        vec3 target = vec3(0.0, 0.0, -1.0);
+        vec3 up = vec3(0.0, 1.0, 0.0);
+        
+        vec3 w = normalize(cameraLoc - target);
+        vec3 u2 = normalize(cross(up, w));
+        vec3 v2 = cross(w, u2);
+        
+        // Coord + random number for ray direction (For anti-aliasing. Gives edge pixels more jagged look)
+        float tempU = gl_FragCoord.x + rand(vec2(13.34 * count + 2.434, 45.64 * count + 63.397), 0.0, 1.0);
+        float u = (tempU / uRes.x - 0.5) * 2.0;
+        float tempV = gl_FragCoord.y + rand(vec2(59.34 * count + 94.495, 75.56 * count + 88.98), 0.0, 1.0);
+        float v = (tempV / uRes.y - 0.5) * 2.0;
+        
+        vec3 dir2 = u * u2 + v * v2 + -w;
+        
+        dir = normalize(dir2);
+    }
+    
+    
+    
+    
+    // Main function
+    
+    void main(void) {
+        
+        // Find colors. Sampling for anti-aliasing.
+        vec3 vColor = vec3(0.0, 0.0, 0.0);
+        int samplesPerPixel = 10;
+        float count = 0.0;
+        
+        for (int i = 0; i < MAX_ITER; i++) {
+            if (i >= samplesPerPixel) {break;}
+            
+            // Ray origin + direction
+            vec3 origin = vec3(0.0, 0.0, 0.0);
+            vec3 dir = vec3(0.0, 0.0, 0.0);
+            camera(count, origin, dir);
+            
+            
+            float t = 1000.0;
+            vec2 id = vec2(-1.0, -1.0);
+            
+            // Pixel color
+            vColor += ray_color(origin, dir, t, id);
+            
+            count++;
+        
+        }
+        
+        
+        // Write color to browser
+        vec3 resultColor = writeColor (vColor, samplesPerPixel);
+        gl_FragColor = vec4(resultColor, 1.0);
+            
+        
+    }//End main
+    
+</script>
+
+
+    
+    
+<script src="gl-matrix-min.js"></script> 
+<script src="mp4cred.js"></script>   
+<body onload="startup();">
+ <canvas id="myGLCanvas" width="800" height="800"></canvas>
+    
+ <p>Notes:</p>
+ <p>1.) There is only one light at position [0.0, 10.0, 0.0].</p>
+ <p>2.) The camera is positionable and is currently at position [-2.0, 2.0, 5.0].</p>
+ <p>3.) The smaller balls are randomized, so you can reload the page and get different positions, materials, and colors every time.</p>
+ <p>4.) Currently, the anti-aliasing is only set to 10, so it doesn't take forever to load, but the outlines look smoother.</p>
+ <p>5.) Since GLSL can't do recursion, refractions will properly show up on reflections, but reflections will only show up as the base material color on refractions. Also, a reflection of a reflection will just show up as the base material color. Same with a refraction on a refraction.</p>
+    
+</body>
+
+</html>
